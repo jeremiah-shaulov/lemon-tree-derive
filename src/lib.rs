@@ -44,20 +44,6 @@ pub fn lem_fn(attr: TokenStream, item: TokenStream) -> TokenStream
 	}
 }
 
-struct AddType
-{	filename: Arc<String>,
-	n_line: usize,
-	name: String,
-}
-
-struct AddRule
-{	filename: Arc<String>,
-	n_line: usize,
-	lhs_name: String,
-	rhs: String,
-	code: String,
-}
-
 struct Alts
 {	alts: Vec<String>,
 	split_points: Vec<usize>,
@@ -116,23 +102,6 @@ impl Alts
 	}
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum LemOptName
-{	ExtraArgument,
-	TokenType,
-	Fallback,
-	Left,
-	Right,
-	Nonassoc,
-	Trace,
-}
-
-struct LemOptValue
-{	filename: Arc<String>,
-	n_line: usize,
-	value: String,
-}
-
 struct TailRecursion<'a>
 {	item_variant: &'a Ident,
 	items_variant: &'a Ident,
@@ -140,16 +109,14 @@ struct TailRecursion<'a>
 	is_head_recursion: bool,
 }
 
-struct ParserDefs
-{	add_types: Vec<AddType>,
-	add_rules: Vec<AddRule>,
-	lem_opts: Vec<(LemOptName, LemOptValue)>,
-	complete_line: usize,
+enum CurBuilder
+{	Active(LemonMintBuilder, String), // (builder, grammar)
+	Complete(usize), // line where start symbol occured
 }
 
 #[derive(Default)]
 struct Derive
-{	parser_defs: Mutex<HashMap<u64, ParserDefs>>,
+{	parser_defs: Mutex<HashMap<u64, CurBuilder>>,
 	filenames: Mutex<HashSet<Arc<String>>>,
 	last_use: Mutex<HashMap<u64, (SystemTime, usize)>>,
 }
@@ -469,36 +436,68 @@ impl Derive
 					{	for a in list.nested
 						{	match a
 							{	NestedMeta::Meta(Meta::NameValue(list)) =>
-								{	let value = match list.lit
-									{	Lit::Str(s) => s.value(),
-										_ =>
-										{	return Err("Option value in #[lem_opt(...)] must be string".to_string());
+								{	self.with_builder
+									(	ns, filename, n_line, |builder, grammar|
+										{	let value = match list.lit
+											{	Lit::Str(s) => s.value(),
+												_ =>
+												{	return Err("Option value in #[lem_opt(...)] must be string".to_string());
+												}
+											};
+											if list.path.is_ident("extra_argument")
+											{	if cfg!(feature = "dump-grammar")
+												{	writeln!(grammar, "%extra_argument {{super::super::{}}}", value).map_err(|_| format!("Write to string failed"))?;
+												}
+												builder.set_extra_argument_type(format!("super::super::{}", value)).map_err(|e| e.to_string())
+											}
+											else if list.path.is_ident("token_type")
+											{	if cfg!(feature = "dump-grammar")
+												{	writeln!(grammar, "%token_type {{{}}}", value).map_err(|_| format!("Write to string failed"))?;
+												}
+												else if cfg!(feature = "dump-lemon-grammar")
+												{	writeln!(grammar, "%token_type {{int}}").map_err(|_| format!("Write to string failed"))?;
+												}
+												builder.set_token_type(value).map_err(|e| e.to_string())
+											}
+											else if list.path.is_ident("fallback")
+											{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
+												{	writeln!(grammar, "%fallback {}.", value.trim()).map_err(|_| format!("Write to string failed"))?;
+												}
+												let v = value.trim_start();
+												let pos = v.find(|c: char| c.is_ascii_whitespace()).unwrap_or(v.len());
+												let fb_token = &v[.. pos];
+												let v = &v[pos ..];
+												builder.add_fallback(filename, n_line, fb_token.to_string(), v).map_err(|e| e.to_string())
+											}
+											else if list.path.is_ident("left")
+											{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
+												{	writeln!(grammar, "%left {}.", value.trim()).map_err(|_| format!("Write to string failed"))?;
+												}
+												builder.set_left(filename, n_line, &value).map_err(|e| e.to_string())
+											}
+											else if list.path.is_ident("right")
+											{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
+												{	writeln!(grammar, "%right {}.", value.trim()).map_err(|_| format!("Write to string failed"))?;
+												}
+												builder.set_right(filename, n_line, &value).map_err(|e| e.to_string())
+											}
+											else if list.path.is_ident("nonassoc")
+											{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
+												{	writeln!(grammar, "%nonassoc {}.", value.trim()).map_err(|_| format!("Write to string failed"))?;
+												}
+												builder.set_nonassoc(filename, n_line, &value).map_err(|e| e.to_string())
+											}
+											else if list.path.is_ident("trace")
+											{	if cfg!(feature = "dump-grammar")
+												{	writeln!(grammar, "%trace {{{}}}", value).map_err(|_| format!("Write to string failed"))?;
+												}
+												builder.set_trace_prompt(value).map_err(|e| e.to_string())
+											}
+											else
+											{	Err("Unknown option in #[lem_opt(...)]. Valid options are: token_type=\"Name\", fallback=\"FB A B C\", left=\"A B C\", right=\"A B C\", nonassoc=\"A B C\", trace=\"prompt\"".to_string())
+											}
 										}
-									};
-									if list.path.is_ident("extra_argument")
-									{	self.add_lem_opt(ns, filename, n_line, LemOptName::ExtraArgument, value)?;
-									}
-									else if list.path.is_ident("token_type")
-									{	self.add_lem_opt(ns, filename, n_line, LemOptName::TokenType, value)?;
-									}
-									else if list.path.is_ident("fallback")
-									{	self.add_lem_opt(ns, filename, n_line, LemOptName::Fallback, value)?;
-									}
-									else if list.path.is_ident("left")
-									{	self.add_lem_opt(ns, filename, n_line, LemOptName::Left, value)?;
-									}
-									else if list.path.is_ident("right")
-									{	self.add_lem_opt(ns, filename, n_line, LemOptName::Right, value)?;
-									}
-									else if list.path.is_ident("nonassoc")
-									{	self.add_lem_opt(ns, filename, n_line, LemOptName::Nonassoc, value)?;
-									}
-									else if list.path.is_ident("trace")
-									{	self.add_lem_opt(ns, filename, n_line, LemOptName::Trace, value)?;
-									}
-									else
-									{	return Err("Unknown option in #[lem_opt(...)]. Valid options are: token_type=\"Name\", fallback=\"FB A B C\", left=\"A B C\", right=\"A B C\", nonassoc=\"A B C\", trace=\"prompt\"".to_string());
-									}
+									)?;
 								}
 								_ =>
 								{	return Err("Cannot parse #[lem_opt(...)]".to_string());
@@ -584,147 +583,91 @@ impl Derive
 		Ok((ns, filename, n_line))
 	}
 
-	fn add_type(&self, ns: u64, filename: &Arc<String>, n_line: usize, name: String, if_not_exists: bool) -> Result<(), String>
+	fn with_builder<F>(&self, ns: u64, filename: &Arc<String>, n_line: usize, cb: F) -> Result<(), String> where F: FnOnce(LemonMintBuilder, &mut String) -> Result<LemonMintBuilder, String>
 	{	let mut map = self.parser_defs.lock().unwrap();
-		let add = AddType {filename: Arc::clone(filename), n_line, name};
 		match map.get_mut(&ns)
 		{	None =>
-			{	let mut add_types = Vec::with_capacity(64);
-				let add_rules = Vec::with_capacity(64);
-				let lem_opts = Vec::new();
-				add_types.push(add);
-				map.insert(ns, ParserDefs {add_types, add_rules, lem_opts, complete_line: usize::MAX});
+			{	let mut builder = LemonMintBuilder::new();
+				let mut grammar = String::new();
+				builder = cb(builder, &mut grammar)?;
+				map.insert(ns, CurBuilder::Active(builder, grammar));
+				Ok(())
 			}
-			Some(parser_defs) =>
-			{	if parser_defs.complete_line != usize::MAX
-				{	return Err(format!("#[derive(LemonTree)] must be the last in file. Found at line {}, but additional directive at line {} in file {}", parser_defs.complete_line, n_line, filename));
-				}
-				if !if_not_exists || parser_defs.add_types.iter().position(|d| d.name==add.name).is_none()
-				{	parser_defs.add_types.push(add);
+			Some(cur_builder) =>
+			{	let my_cur_builder = mem::replace(cur_builder, CurBuilder::Complete(usize::MAX));
+				match my_cur_builder
+				{	CurBuilder::Active(mut builder, mut grammar) =>
+					{	builder = cb(builder, &mut grammar)?;
+						mem::replace(cur_builder, CurBuilder::Active(builder, grammar));
+						Ok(())
+					}
+					CurBuilder::Complete(complete_n_line) =>
+					{	mem::replace(cur_builder, CurBuilder::Complete(complete_n_line));
+						Err(format!("#[derive(LemonTree)] must be the last in file. Found at line {}, but additional directive at line {} in file {}", complete_n_line, n_line, filename))
+					}
 				}
 			}
 		}
-		Ok(())
+	}
+
+	fn add_type(&self, ns: u64, filename: &Arc<String>, n_line: usize, name: String, if_not_exists: bool) -> Result<(), String>
+	{	self.with_builder
+		(	ns, filename, n_line, move |builder, grammar|
+			{	let rust_type = format!("super::super::{}", name);
+				if cfg!(feature = "dump-grammar")
+				{	writeln!(grammar, "%type {} {{{}}}", name, rust_type).map_err(|_| format!("Write to string failed"))?;
+				}
+				if !if_not_exists || builder.get_type(&name).is_none()
+				{	builder.add_type(filename, n_line, name, rust_type).map_err(|e| e.to_string())
+				}
+				else
+				{	Ok(builder)
+				}
+			}
+		)
 	}
 
 	fn add_rule(&self, ns: u64, filename: &Arc<String>, n_line: usize, lhs_name: String, rhs: String, code: String) -> Result<(), String>
-	{	let mut map = self.parser_defs.lock().unwrap();
-		if let Some(parser_defs) = map.get_mut(&ns)
-		{	if parser_defs.complete_line != usize::MAX
-			{	return Err(format!("#[derive(LemonTree)] must be the last in file. Found at line {}, but additional directive at line {} in file {}", parser_defs.complete_line, n_line, filename));
+	{	self.with_builder
+		(	ns, filename, n_line, move |builder, grammar|
+			{	if cfg!(feature = "dump-grammar")
+				{	writeln!(grammar, "{} ::= {}. {{{}}}", lhs_name, rhs.trim(), code).map_err(|_| format!("Write to string failed"))?;
+				}
+				else if cfg!(feature = "dump-lemon-grammar")
+				{	writeln!(grammar, "{} ::= {}.", Self::lc_first(&lhs_name), Self::rhs_to_lemon(rhs.trim())).map_err(|_| format!("Write to string failed"))?;
+				}
+				builder.add_rule(filename, n_line, lhs_name, &rhs, code).map_err(|e| e.to_string())
 			}
-			parser_defs.add_rules.push(AddRule {filename: Arc::clone(filename), n_line, lhs_name, rhs, code});
-		}
-		Ok(())
-	}
-
-	fn add_lem_opt(&self, ns: u64, filename: &Arc<String>, n_line: usize, name: LemOptName, value: String) -> Result<(), String>
-	{	let mut map = self.parser_defs.lock().unwrap();
-		if let Some(parser_defs) = map.get_mut(&ns)
-		{	if parser_defs.complete_line != usize::MAX
-			{	return Err(format!("#[derive(LemonTree)] must be the last in file. Found at line {}, but additional directive at line {} in file {}", parser_defs.complete_line, n_line, filename));
-			}
-			parser_defs.lem_opts.push((name, LemOptValue {filename: Arc::clone(filename), n_line, value}));
-		}
-		Ok(())
+		)
 	}
 
 	fn get_lemon_result(&self, ns: u64, filename: &Arc<String>, n_line: usize, start_symbol_name: String) -> Result<String, String>
 	{	let mut map = self.parser_defs.lock().unwrap();
-		if let Some(parser_defs) = map.get_mut(&ns)
-		{	if parser_defs.complete_line != usize::MAX
-			{	return Err(format!("Double #[derive(LemonTree)] in the same file. First at line {}, and then at line {} in file {}", parser_defs.complete_line, n_line, filename));
+		match map.remove(&ns)
+		{	None =>
+			{	Err("No parser rules".to_string())
 			}
-			let add_types = mem::replace(&mut parser_defs.add_types, Vec::new());
-			let add_rules = mem::replace(&mut parser_defs.add_rules, Vec::new());
-			let lem_opts = mem::replace(&mut parser_defs.lem_opts, Vec::new());
-			if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
-			{	eprintln!("/* Parser lem_{} from {} */", ns, filename);
-			}
-			let mut builder = LemonMintBuilder::new();
-			if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
-			{	eprintln!("%start_symbol {{{}}}", if cfg!(feature = "dump-lemon-grammar") {Self::lc_first(&start_symbol_name).into()} else {Cow::from(&start_symbol_name)});
-			}
-			builder = builder.set_start_symbol(&filename, n_line, start_symbol_name).map_err(|e| e.to_string())?;
-			for add in add_types
-			{	let rust_type = format!("super::super::{}", add.name);
-				if cfg!(feature = "dump-grammar")
-				{	eprintln!("%type {} {{{}}}", add.name, rust_type);
+			Some(CurBuilder::Active(mut builder, grammar)) =>
+			{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
+				{	eprintln!("/* Parser lem_{} from {} */", ns, filename);
 				}
-				builder = builder.add_type(&add.filename, add.n_line, add.name, rust_type).map_err(|e| e.to_string())?;
-			}
-			for (name, value) in lem_opts
-			{	match name
-				{	LemOptName::ExtraArgument =>
-					{	if cfg!(feature = "dump-grammar")
-						{	eprintln!("%extra_argument {{super::super::{}}}", value.value);
-						}
-						builder = builder.set_extra_argument_type(format!("super::super::{}", value.value)).map_err(|e| e.to_string())?;
-					}
-					LemOptName::TokenType =>
-					{	if cfg!(feature = "dump-grammar")
-						{	eprintln!("%token_type {{{}}}", value.value);
-						}
-						else if cfg!(feature = "dump-lemon-grammar")
-						{	eprintln!("%token_type {{int}}");
-						}
-						builder = builder.set_token_type(value.value).map_err(|e| e.to_string())?;
-					}
-					LemOptName::Fallback =>
-					{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
-						{	eprintln!("%fallback {}.", value.value.trim());
-						}
-						let v = value.value.trim_start();
-						let pos = v.find(|c: char| c.is_ascii_whitespace()).unwrap_or(v.len());
-						let fb_token = &v[.. pos];
-						let v = &v[pos ..];
-						builder = builder.add_fallback(&value.filename, value.n_line, fb_token.to_string(), v).map_err(|e| e.to_string())?;
-					}
-					LemOptName::Left =>
-					{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
-						{	eprintln!("%left {}.", value.value.trim());
-						}
-						builder = builder.set_left(&value.filename, value.n_line, &value.value).map_err(|e| e.to_string())?;
-					}
-					LemOptName::Right =>
-					{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
-						{	eprintln!("%right {}.", value.value.trim());
-						}
-						builder = builder.set_right(&value.filename, value.n_line, &value.value).map_err(|e| e.to_string())?;
-					}
-					LemOptName::Nonassoc =>
-					{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
-						{	eprintln!("%nonassoc {}.", value.value.trim());
-						}
-						builder = builder.set_nonassoc(&value.filename, value.n_line, &value.value).map_err(|e| e.to_string())?;
-					}
-					LemOptName::Trace =>
-					{	if cfg!(feature = "dump-grammar")
-						{	eprintln!("%trace {{{}}}", value.value);
-						}
-						builder = builder.set_trace_prompt(value.value).map_err(|e| e.to_string())?;
-					}
+				if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
+				{	eprintln!("%start_symbol {{{}}}", if cfg!(feature = "dump-lemon-grammar") {Self::lc_first(&start_symbol_name).into()} else {Cow::from(&start_symbol_name)});
 				}
-			}
-			for add in add_rules
-			{	if cfg!(feature = "dump-grammar")
-				{	eprintln!("{} ::= {}. {{{}}}", add.lhs_name, add.rhs.trim(), add.code);
+				builder = builder.set_start_symbol(&filename, n_line, start_symbol_name).map_err(|e| e.to_string())?;
+				if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
+				{	eprintln!("{}", grammar);
 				}
-				else if cfg!(feature = "dump-lemon-grammar")
-				{	eprintln!("{} ::= {}.", Self::lc_first(&add.lhs_name), Self::rhs_to_lemon(add.rhs.trim()));
-				}
-				builder = builder.add_rule(&add.filename, add.n_line, add.lhs_name, &add.rhs, add.code).map_err(|e| e.to_string())?;
+				let mut rust = Vec::new();
+				let lemon = builder.try_into_lemon().map_err(|e| e.to_string())?;
+				lemon.gen_rust(&mut rust).map_err(|e| e.to_string())?;
+				map.insert(ns, CurBuilder::Complete(n_line));
+				String::from_utf8(rust).map_err(|e| e.to_string())
 			}
-			if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
-			{	eprintln!();
+			Some(CurBuilder::Complete(complete_n_line)) =>
+			{	Err(format!("Double #[derive(LemonTree)] in the same file. First at line {}, and then at line {} in file {}", complete_n_line, n_line, filename))
 			}
-			let mut rust = Vec::new();
-			let lemon = builder.try_into_lemon().map_err(|e| e.to_string())?;
-			lemon.gen_rust(&mut rust).map_err(|e| e.to_string())?;
-			parser_defs.complete_line = n_line;
-			return String::from_utf8(rust).map_err(|e| e.to_string());
-		};
-		Err("No parser rules".to_string())
+		}
 	}
 
 	fn lem_fn_attr(&self, args: TokenStream, item: TokenStream) -> Result<TokenStream, String>
