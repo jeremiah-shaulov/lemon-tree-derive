@@ -1,3 +1,5 @@
+//! Helper crate for [lemon-tree](https://crates.io/crates/lemon-tree). Rust-way parser builder.
+
 #![feature(proc_macro_span)]
 
 extern crate lemon_mint;
@@ -10,7 +12,7 @@ use std::collections::{HashSet, HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, Arc};
 use std::time::SystemTime;
-use syn::{self, DeriveInput, DataEnum, Data, Attribute, Meta, NestedMeta, Lit, Ident, ItemFn, ReturnType, Type, TypePath, Path, PathSegment, PathArguments, FnArg, PatType, Pat, GenericArgument, export::Span};
+use syn::{self, DeriveInput, Data, Attribute, Meta, NestedMeta, Lit, Ident, ItemFn, ReturnType, Type, TypePath, Path, PathSegment, PathArguments, FnArg, PatType, Pat, export::Span};
 use crate::proc_macro::TokenStream;
 use quote::quote;
 use once_cell::sync::OnceCell;
@@ -20,6 +22,7 @@ use std::fmt::Write;
 
 static DERIVE: OnceCell<Derive> = OnceCell::new();
 
+/// Makes enum/struct a start symbol of current parser. Must appear the last parser attribute in file.
 #[proc_macro_derive(LemonTree, attributes(lem, lem_opt))]
 pub fn derive_lemon_tree(input: TokenStream) -> TokenStream
 {	match DERIVE.get_or_init(|| Default::default()).derive(input, true)
@@ -28,6 +31,7 @@ pub fn derive_lemon_tree(input: TokenStream) -> TokenStream
 	}
 }
 
+/// Makes enum/struct a regular nonterminal symbol. Must appear before `#[derive(LemonTree)]` and `#[lem_fn()]` in the same rust file.
 #[proc_macro_derive(LemonTreeNode, attributes(lem))]
 pub fn derive_lemon_tree_node(input: TokenStream) -> TokenStream
 {	match DERIVE.get_or_init(|| Default::default()).derive(input, false)
@@ -36,6 +40,7 @@ pub fn derive_lemon_tree_node(input: TokenStream) -> TokenStream
 	}
 }
 
+/// Makes module-global public function an action for specified Lemon parser expression.
 #[proc_macro_attribute]
 pub fn lem_fn(attr: TokenStream, item: TokenStream) -> TokenStream
 {	match DERIVE.get_or_init(|| Default::default()).lem_fn_attr(attr, item)
@@ -102,23 +107,22 @@ impl Alts
 	}
 }
 
-struct TailRecursion<'a>
-{	item_variant: &'a Ident,
-	items_variant: &'a Ident,
-	item_type: &'a Ident,
-	is_head_recursion: bool,
-}
-
 enum CurBuilder
 {	Active(LemonMintBuilder, String), // (builder, grammar)
 	Complete(usize), // line where start symbol occured
 }
 
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+struct Ns
+{	hash: u64,
+	is_real_file: bool,
+}
+
 #[derive(Default)]
 struct Derive
-{	parser_defs: Mutex<HashMap<u64, CurBuilder>>,
+{	builders: Mutex<HashMap<Ns, CurBuilder>>,
 	filenames: Mutex<HashSet<Arc<String>>>,
-	last_use: Mutex<HashMap<u64, (SystemTime, usize)>>,
+	last_use: Mutex<HashMap<Ns, (SystemTime, usize)>>,
 }
 
 impl Derive
@@ -127,7 +131,6 @@ impl Derive
 		self.reinit_if_needed(ns, n_line);
 		let ast: &DeriveInput = &syn::parse(input).unwrap();
 		let name = &ast.ident;
-		let mut tail_recursion = None;
 		self.add_type(ns, &filename, n_line, name.to_string(), false)?;
 		self.parse_lem_opt_attrs(ns, &filename, n_line, &ast.attrs)?;
 		match &ast.data
@@ -154,8 +157,6 @@ impl Derive
 						}
 					}
 				}
-				// is this enum a tail recursion?
-				tail_recursion = Self::is_tail_recursion(name, &data_enum);
 			}
 			Data::Struct(data_struct) =>
 			{	for value in Self::parse_lem_attrs(&ast.attrs)?
@@ -205,7 +206,7 @@ impl Derive
 		if is_start_symbol
 		{	let rust = self.get_lemon_result(ns, &filename, n_line, name.to_string())?;
 			let rust: proc_macro2::TokenStream = rust.parse().unwrap();
-			let ns_name = Ident::new(&format!("lem_{}", ns), Span::call_site());
+			let ns_name = Ident::new(&format!("lem_{}", ns.hash), Span::call_site());
 			code = quote!
 			{	#code
 				impl #impl_generics lemon_tree::LemonTree for #name #ty_generics #where_clause
@@ -220,75 +221,18 @@ impl Derive
 				mod #ns_name { #rust }
 			};
 		}
-		if let Some(TailRecursion {item_variant, items_variant, item_type, is_head_recursion}) = tail_recursion
-		{	let iter_type_name = Ident::new(&format!("{}Iter", name), Span::call_site());
-			let item_names = if !is_head_recursion {quote!(items, item)} else {quote!(item, items)};
-			let item_names_opt = if !is_head_recursion {quote!(items, _item)} else {quote!(_item, items)};
-			code = quote!
-			{	#code
-
-				impl #name
-				{	fn len(&self) -> usize
-					{	match self
-						{	#name::#item_variant(_item) => 1,
-							#name::#items_variant(#item_names_opt) => 1 + items.len(),
-						}
-					}
-				}
-				impl IntoIterator for #name
-				{	type Item = #item_type;
-					type IntoIter = #iter_type_name;
-
-					fn into_iter(self) -> Self::IntoIter
-					{	#iter_type_name {len: self.len(), item: Some(self)}
-					}
-				}
-				pub struct #iter_type_name
-				{	item: Option<#name>,
-					len: usize,
-				}
-				impl Iterator for #iter_type_name
-				{	type Item = #item_type;
-
-					fn size_hint(&self) -> (usize, Option<usize>)
-					{	(self.len, Some(self.len))
-					}
-
-					fn next(&mut self) -> Option<Self::Item>
-					{	match self.item.take()
-						{	None => None,
-							Some(#name::#item_variant(item)) =>
-							{	self.item = None;
-								self.len -= 1;
-								Some(item)
-							},
-							Some(#name::#items_variant(#item_names)) =>
-							{	self.item = Some(*items);
-								self.len -= 1;
-								Some(item)
-							}
-						}
-					}
-				}
-				impl Into<Vec<#item_type>> for #name
-				{	fn into(self) -> Vec<#item_type>
-					{	self.into_iter().collect()
-					}
-				}
-			};
-		}
 		self.log_last_use(ns, n_line);
 		Ok(code.into())
 	}
 
-	fn log_last_use(&self, ns: u64, n_line: usize)
+	fn log_last_use(&self, ns: Ns, n_line: usize)
 	{	self.last_use.lock().unwrap().insert(ns, (SystemTime::now(), n_line));
 	}
 
 	/// This proc-macro crate can be reused by compilers and development tools.
 	/// The same instance can be used to scan the same file several times.
-	/// If i see that n_line is <= than the last call n_line, and more than 1 sec passed since last call, i will reinitialize self.
-	fn reinit_if_needed(&self, ns: u64, n_line: usize)
+	/// If i see that n_line is <= than the last call n_line, and either more than 1 sec passed since last call, or current builder complete, then i will reinitialize self.
+	fn reinit_if_needed(&self, ns: Ns, n_line: usize)
 	{	let mut want_reinit = false;
 		if let Some((at, at_n_line)) = self.last_use.lock().unwrap().get_mut(&ns)
 		{	if n_line <= *at_n_line
@@ -296,112 +240,21 @@ impl Derive
 				{	if elapsed.as_millis() > 1000
 					{	want_reinit = true;
 					}
+					else
+					{	// maybe requested parser complete
+						let map = self.builders.lock().unwrap();
+						if let Some(CurBuilder::Complete(_)) = map.get(&ns)
+						{	want_reinit = true;
+						}
+					}
 				}
 			}
 		}
 		if want_reinit
-		{	self.parser_defs.lock().unwrap().clear();
+		{	self.builders.lock().unwrap().clear();
 			self.filenames.lock().unwrap().clear();
 			self.last_use.lock().unwrap().clear();
 		}
-	}
-
-	fn is_tail_recursion<'a>(enum_name: &'a Ident, data_enum: &'a DataEnum) -> Option<TailRecursion<'a>>
-	{	let mut has_one = false; // has variant Item(ItemType)
-		let mut has_two = false; // has variant Items(Box<EnumName>, ItemType)
-		let mut item_type = None; // ItemType
-		let mut item_variant = None; // Item for EnumName::Item
-		let mut items_variant = None; // Items for EnumName::Items
-		let mut is_head_recursion = false; // true if Items(ItemType, Box<EnumName>), false if Items(Box<EnumName>, ItemType)
-		if data_enum.variants.len() != 2
-		{	return None;
-		}
-		for variant in &data_enum.variants
-		{	if variant.fields.len()==0 || variant.fields.len()>2
-			{	return None;
-			}
-			let mut item_n = usize::MAX;
-			let mut items_n = usize::MAX;
-			for (i, field) in variant.fields.iter().enumerate()
-			{	match field.ty
-				{	Type::Path(TypePath {qself: None, path: Path {leading_colon: None, ref segments}}) =>
-					{	if segments.len() != 1
-						{	return None;
-						}
-						let seg = &segments[0];
-						match seg.arguments
-						{	PathArguments::None =>
-							{	// like Name
-								if let Some(cur) = item_type
-								{	if cur != &seg.ident
-									{	return None;
-									}
-								}
-								item_type = Some(&seg.ident);
-								item_n = i;
-							}
-							PathArguments::AngleBracketed(ref args) =>
-							{	// like Box<Name>
-								if seg.ident=="Box" && args.args.len()==1
-								{	match args.args[0]
-									{	GenericArgument::Type(Type::Path(TypePath {qself: None, path: Path {leading_colon: None, ref segments}})) =>
-										{	if segments.len() != 1
-											{	return None;
-											}
-											let seg = &segments[0];
-											match seg.arguments
-											{	PathArguments::None =>
-												{	if seg.ident != *enum_name
-													{	return None;
-													}
-													items_n = i;
-												}
-												_ => return None
-											}
-										}
-										_ => return None
-									}
-								}
-							}
-							_ => return None
-						}
-					}
-					_ => return None
-				}
-			}
-			if item_n == usize::MAX
-			{	return None;
-			}
-			if variant.fields.len() == 1
-			{	if has_one
-				{	return None;
-				}
-				has_one = true;
-				item_variant = Some(&variant.ident);
-			}
-			else
-			{	if items_n == usize::MAX
-				{	return None;
-				}
-				if has_two
-				{	return None;
-				}
-				has_two = true;
-				is_head_recursion = item_n == 0;
-				items_variant = Some(&variant.ident);
-			}
-		}
-		if !has_one || !has_two
-		{	return None;
-		}
-		Some
-		(	TailRecursion
-			{	item_variant: item_variant.unwrap(),
-				items_variant: items_variant.unwrap(),
-				item_type: item_type.unwrap(),
-				is_head_recursion
-			}
-		)
 	}
 
 	fn parse_lem_attrs(attrs: &Vec<Attribute>) -> Result<Vec<String>, String>
@@ -428,7 +281,7 @@ impl Derive
 		Ok(values)
 	}
 
-	fn parse_lem_opt_attrs(&self, ns: u64, filename: &Arc<String>, n_line: usize, attrs: &Vec<Attribute>) -> Result<(), String>
+	fn parse_lem_opt_attrs(&self, ns: Ns, filename: &Arc<String>, n_line: usize, attrs: &Vec<Attribute>) -> Result<(), String>
 	{	for a in attrs
 		{	match a.parse_meta()
 			{	Ok(Meta::List(list)) =>
@@ -563,28 +416,26 @@ impl Derive
 		Ok((subst, aliases))
 	}
 
-	fn get_location(&self, input: TokenStream) -> Result<(u64, Arc<String>, usize), String>
+	fn get_location(&self, input: TokenStream) -> Result<(Ns, Arc<String>, usize), String>
 	{	let span = input.into_iter().next().unwrap().span();
 		let filename = span.source_file();
 		let n_line = span.start();
-		if !filename.is_real()
-		{	return Err("Unknown filename".to_string());
-		}
+		let is_real_file = filename.is_real();
 		let filename = filename.path().to_string_lossy().into_owned();
 		let n_line = n_line.line;
 		let mut hasher = DefaultHasher::new();
 		filename.hash(&mut hasher);
-		let ns = hasher.finish();
+		let hash = hasher.finish();
 		let filename = Arc::new(filename);
 		let filename = match self.filenames.lock().unwrap().get(&filename)
 		{	None => filename,
 			Some(filename) => Arc::clone(&filename),
 		};
-		Ok((ns, filename, n_line))
+		Ok((Ns{hash, is_real_file}, filename, n_line))
 	}
 
-	fn with_builder<F>(&self, ns: u64, filename: &Arc<String>, n_line: usize, cb: F) -> Result<(), String> where F: FnOnce(LemonMintBuilder, &mut String) -> Result<LemonMintBuilder, String>
-	{	let mut map = self.parser_defs.lock().unwrap();
+	fn with_builder<F>(&self, ns: Ns, filename: &Arc<String>, n_line: usize, cb: F) -> Result<(), String> where F: FnOnce(LemonMintBuilder, &mut String) -> Result<LemonMintBuilder, String>
+	{	let mut map = self.builders.lock().unwrap();
 		match map.get_mut(&ns)
 		{	None =>
 			{	let mut builder = LemonMintBuilder::new();
@@ -610,7 +461,7 @@ impl Derive
 		}
 	}
 
-	fn add_type(&self, ns: u64, filename: &Arc<String>, n_line: usize, name: String, if_not_exists: bool) -> Result<(), String>
+	fn add_type(&self, ns: Ns, filename: &Arc<String>, n_line: usize, name: String, if_not_exists: bool) -> Result<(), String>
 	{	self.with_builder
 		(	ns, filename, n_line, move |builder, grammar|
 			{	let rust_type = format!("super::super::{}", name);
@@ -627,7 +478,7 @@ impl Derive
 		)
 	}
 
-	fn add_rule(&self, ns: u64, filename: &Arc<String>, n_line: usize, lhs_name: String, rhs: String, code: String) -> Result<(), String>
+	fn add_rule(&self, ns: Ns, filename: &Arc<String>, n_line: usize, lhs_name: String, rhs: String, code: String) -> Result<(), String>
 	{	self.with_builder
 		(	ns, filename, n_line, move |builder, grammar|
 			{	if cfg!(feature = "dump-grammar")
@@ -641,15 +492,15 @@ impl Derive
 		)
 	}
 
-	fn get_lemon_result(&self, ns: u64, filename: &Arc<String>, n_line: usize, start_symbol_name: String) -> Result<String, String>
-	{	let mut map = self.parser_defs.lock().unwrap();
+	fn get_lemon_result(&self, ns: Ns, filename: &Arc<String>, n_line: usize, start_symbol_name: String) -> Result<String, String>
+	{	let mut map = self.builders.lock().unwrap();
 		match map.remove(&ns)
 		{	None =>
 			{	Err("No parser rules".to_string())
 			}
 			Some(CurBuilder::Active(mut builder, grammar)) =>
 			{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
-				{	eprintln!("/* Parser lem_{} from {} */", ns, filename);
+				{	eprintln!("/* Parser lem_{} from {} */", ns.hash, filename);
 				}
 				if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
 				{	eprintln!("%start_symbol {{{}}}", if cfg!(feature = "dump-lemon-grammar") {Self::lc_first(&start_symbol_name).into()} else {Cow::from(&start_symbol_name)});
@@ -661,7 +512,15 @@ impl Derive
 				let mut rust = Vec::new();
 				let lemon = builder.try_into_lemon().map_err(|e| e.to_string())?;
 				lemon.gen_rust(&mut rust).map_err(|e| e.to_string())?;
-				map.insert(ns, CurBuilder::Complete(n_line));
+				map.insert
+				(	ns,
+					if ns.is_real_file
+					{	CurBuilder::Complete(n_line)
+					}
+					else // allow multiple builders in the same file, if this is not a real file (like doc comment)
+					{	CurBuilder::Active(LemonMintBuilder::new(), String::new())
+					}
+				);
 				String::from_utf8(rust).map_err(|e| e.to_string())
 			}
 			Some(CurBuilder::Complete(complete_n_line)) =>
