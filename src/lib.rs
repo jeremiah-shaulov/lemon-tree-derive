@@ -215,7 +215,7 @@ impl Derive
 					type Parser = #ns_name::code::Parser;
 				}
 				impl #impl_generics #name #ty_generics #where_clause
-				{	fn get_parser(extra: #ns_name::code::ExtraArgumentType) -> #ns_name::code::Parser
+				{	pub fn get_parser(extra: #ns_name::code::ExtraArgumentType) -> #ns_name::code::Parser
 					{	#ns_name::code::Parser::new(extra)
 					}
 				}
