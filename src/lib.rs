@@ -219,8 +219,33 @@ impl Derive
 					{	#ns_name::code::Parser::new(extra)
 					}
 				}
-				mod #ns_name { #rust }
 			};
+			if !cfg!(feature = "debug-parser-to-file")
+			{	code = quote![#code mod #ns_name { #rust }];
+			}
+			else
+			{	code = quote![#code mod #ns_name;];
+				use std::io::{Read, Write, Seek, SeekFrom};
+				use std::fs::{OpenOptions, create_dir};
+				use std::path::PathBuf;
+				let rust_str = rust.to_string();
+				let mut path = PathBuf::from(filename.as_ref());
+				let dirname = path.file_stem().unwrap().to_string_lossy().into_owned();
+				path.pop();
+				path.push(dirname);
+				if !path.exists()
+				{	create_dir(&path).unwrap();
+				}
+				path.push(format!("{}.rs", ns_name));
+				let mut file = OpenOptions::new().read(true).write(true).create(true).open(path).map_err(|e| e.to_string())?;
+				let mut cur_rust_str = Vec::new();
+				file.read_to_end(&mut cur_rust_str).unwrap();
+				if cur_rust_str != rust_str.as_bytes()
+				{	file.seek(SeekFrom::Start(0)).unwrap();
+					file.set_len(0).unwrap();
+					write!(file, "{} ", rust_str).unwrap();
+				}
+			}
 		}
 		self.log_last_use(ns, n_line);
 		Ok(code.into())

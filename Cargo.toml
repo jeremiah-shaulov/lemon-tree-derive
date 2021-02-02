@@ -1,6 +1,6 @@
 [package]
 name = "lemon-tree-derive"
-version = "1.0.2"
+version = "1.0.3"
 authors = ["Jeremiah Shaulov <jeremiah.shaulov@gmail.com>"]
 edition = "2018"
 license = "MIT"
@@ -16,6 +16,7 @@ proc-macro = true
 [features]
 dump-grammar = []
 dump-lemon-grammar = []
+debug-parser-to-file = []
 
 [dependencies]
 proc-macro2 = "1.0"
