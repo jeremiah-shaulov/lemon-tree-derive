@@ -8,8 +8,8 @@ extern crate proc_macro2;
 extern crate once_cell;
 
 use std::mem;
-use std::collections::{HashSet, HashMap, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::collections::{HashSet, HashMap};
+use std::hash::Hash;
 use std::sync::{Mutex, Arc};
 use std::time::SystemTime;
 use syn::{self, DeriveInput, Data, Attribute, Meta, NestedMeta, Lit, Ident, ItemFn, ReturnType, Type, TypePath, Path, PathSegment, PathArguments, FnArg, PatType, Pat};
@@ -113,27 +113,45 @@ enum CurBuilder
 	Complete(usize), // line where start symbol occured
 }
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct Ns
-{	hash: u64,
+{	name: Arc<String>,
 	is_real_file: bool,
+}
+
+#[derive(Default)]
+struct StringsPool
+{	pool: HashSet<Arc<String>>,
+}
+impl StringsPool
+{	pub fn get(&mut self, s: String) -> Arc<String>
+	{	let s = Arc::new(s);
+		match self.pool.get(&s)
+		{	None => s,
+			Some(s) => Arc::clone(&s),
+		}
+	}
+
+	pub fn clear(&mut self)
+	{	self.pool.clear();
+	}
 }
 
 #[derive(Default)]
 struct Derive
 {	builders: Mutex<HashMap<Ns, CurBuilder>>,
-	filenames: Mutex<HashSet<Arc<String>>>,
+	strings_pool: Mutex<StringsPool>,
 	last_use: Mutex<HashMap<Ns, (SystemTime, usize)>>,
 }
 
 impl Derive
 {	pub fn derive(&self, input: TokenStream, is_start_symbol: bool) -> Result<TokenStream, String>
 	{	let (ns, filename, n_line) = self.get_location(input.clone())?;
-		self.reinit_if_needed(ns, n_line);
+		self.reinit_if_needed(&ns, n_line);
 		let ast: &DeriveInput = &syn::parse(input).unwrap();
 		let name = &ast.ident;
-		self.add_type(ns, &filename, n_line, name.to_string(), false)?;
-		self.parse_lem_opt_attrs(ns, &filename, n_line, &ast.attrs)?;
+		self.add_type(&ns, &filename, n_line, name.to_string(), false)?;
+		self.parse_lem_opt_attrs(&ns, &filename, n_line, &ast.attrs)?;
 		match &ast.data
 		{	Data::Enum(data_enum) =>
 			{	for variant in &data_enum.variants
@@ -154,7 +172,7 @@ impl Derive
 							if variant.fields.len() > 0
 							{	action = quote!((#action));
 							}
-							self.add_rule(ns, &filename, n_line, name.to_string(), value, quote!(super::super::#name::#variant_name #action).to_string()).map_err(|e| format!("In enum variant {}: {}", variant.ident, e))?;
+							self.add_rule(&ns, &filename, n_line, name.to_string(), value, quote!(super::super::#name::#variant_name #action).to_string()).map_err(|e| format!("In enum variant {}: {}", variant.ident, e))?;
 						}
 					}
 				}
@@ -190,7 +208,7 @@ impl Derive
 							}
 						}
 						action = quote!(super::super::#name {#action});
-						self.add_rule(ns, &filename, n_line, name.to_string(), value, action.to_string())?;
+						self.add_rule(&ns, &filename, n_line, name.to_string(), value, action.to_string())?;
 					}
 				}
 			},
@@ -205,9 +223,9 @@ impl Derive
 			}
 		};
 		if is_start_symbol
-		{	let rust = self.get_lemon_result(ns, &filename, n_line, name.to_string())?;
+		{	let rust = self.get_lemon_result(&ns, &filename, n_line, name.to_string())?;
 			let rust: proc_macro2::TokenStream = rust.parse().unwrap();
-			let ns_name = Ident::new(&format!("lem_{}", ns.hash), Span::call_site());
+			let ns_name = Ident::new(ns.name.as_ref(), Span::call_site());
 			code = quote!
 			{	#code
 				impl #impl_generics lemon_tree::LemonTree for #name #ty_generics #where_clause
@@ -230,13 +248,12 @@ impl Derive
 				use std::path::PathBuf;
 				let rust_str = rust.to_string();
 				let mut path = PathBuf::from(filename.as_ref());
-				let dirname = path.file_stem().unwrap().to_string_lossy().into_owned();
 				path.pop();
-				path.push(dirname);
+				path.push(ns.name.as_ref());
 				if !path.exists()
 				{	create_dir(&path).unwrap();
 				}
-				path.push(format!("{}.rs", ns_name));
+				path.push(format!("{}.rs", ns.name));
 				let mut file = OpenOptions::new().read(true).write(true).create(true).open(path).map_err(|e| e.to_string())?;
 				let mut cur_rust_str = Vec::new();
 				file.read_to_end(&mut cur_rust_str).unwrap();
@@ -247,20 +264,20 @@ impl Derive
 				}
 			}
 		}
-		self.log_last_use(ns, n_line);
+		self.log_last_use(&ns, n_line);
 		Ok(code.into())
 	}
 
-	fn log_last_use(&self, ns: Ns, n_line: usize)
-	{	self.last_use.lock().unwrap().insert(ns, (SystemTime::now(), n_line));
+	fn log_last_use(&self, ns: &Ns, n_line: usize)
+	{	self.last_use.lock().unwrap().insert(ns.clone(), (SystemTime::now(), n_line));
 	}
 
 	/// This proc-macro crate can be reused by compilers and development tools.
 	/// The same instance can be used to scan the same file several times.
 	/// If i see that n_line is <= than the last call n_line, and either more than 1 sec passed since last call, or current builder complete, then i will reinitialize self.
-	fn reinit_if_needed(&self, ns: Ns, n_line: usize)
+	fn reinit_if_needed(&self, ns: &Ns, n_line: usize)
 	{	let mut want_reinit = false;
-		if let Some((at, at_n_line)) = self.last_use.lock().unwrap().get_mut(&ns)
+		if let Some((at, at_n_line)) = self.last_use.lock().unwrap().get_mut(ns)
 		{	if n_line <= *at_n_line
 			{	if let Ok(elapsed) = SystemTime::now().duration_since(*at)
 				{	if elapsed.as_millis() > 1000
@@ -269,7 +286,7 @@ impl Derive
 					else
 					{	// maybe requested parser complete
 						let map = self.builders.lock().unwrap();
-						if let Some(CurBuilder::Complete(_)) = map.get(&ns)
+						if let Some(CurBuilder::Complete(_)) = map.get(ns)
 						{	want_reinit = true;
 						}
 					}
@@ -278,7 +295,7 @@ impl Derive
 		}
 		if want_reinit
 		{	self.builders.lock().unwrap().clear();
-			self.filenames.lock().unwrap().clear();
+			self.strings_pool.lock().unwrap().clear();
 			self.last_use.lock().unwrap().clear();
 		}
 	}
@@ -307,7 +324,7 @@ impl Derive
 		Ok(values)
 	}
 
-	fn parse_lem_opt_attrs(&self, ns: Ns, filename: &Arc<String>, n_line: usize, attrs: &Vec<Attribute>) -> Result<(), String>
+	fn parse_lem_opt_attrs(&self, ns: &Ns, filename: &Arc<String>, n_line: usize, attrs: &Vec<Attribute>) -> Result<(), String>
 	{	for a in attrs
 		{	match a.parse_meta()
 			{	Ok(Meta::List(list)) =>
@@ -447,27 +464,21 @@ impl Derive
 		let filename = span.source_file();
 		let n_line = span.start();
 		let is_real_file = filename.is_real();
-		let filename = filename.path().to_string_lossy().into_owned();
+		let mut strings_pool = self.strings_pool.lock().unwrap();
+		let ns_name = strings_pool.get(filename.path().file_stem().unwrap().to_string_lossy().into_owned());
+		let filename = strings_pool.get(filename.path().to_string_lossy().into_owned());
 		let n_line = n_line.line;
-		let mut hasher = DefaultHasher::new();
-		filename.hash(&mut hasher);
-		let hash = hasher.finish();
-		let filename = Arc::new(filename);
-		let filename = match self.filenames.lock().unwrap().get(&filename)
-		{	None => filename,
-			Some(filename) => Arc::clone(&filename),
-		};
-		Ok((Ns{hash, is_real_file}, filename, n_line))
+		Ok((Ns{name: ns_name, is_real_file}, filename, n_line))
 	}
 
-	fn with_builder<F>(&self, ns: Ns, filename: &Arc<String>, n_line: usize, cb: F) -> Result<(), String> where F: FnOnce(LemonMintBuilder, &mut String) -> Result<LemonMintBuilder, String>
+	fn with_builder<F>(&self, ns: &Ns, filename: &Arc<String>, n_line: usize, cb: F) -> Result<(), String> where F: FnOnce(LemonMintBuilder, &mut String) -> Result<LemonMintBuilder, String>
 	{	let mut map = self.builders.lock().unwrap();
-		match map.get_mut(&ns)
+		match map.get_mut(ns)
 		{	None =>
 			{	let mut builder = LemonMintBuilder::new();
 				let mut grammar = String::new();
 				builder = cb(builder, &mut grammar)?;
-				map.insert(ns, CurBuilder::Active(builder, grammar));
+				map.insert(ns.clone(), CurBuilder::Active(builder, grammar));
 				Ok(())
 			}
 			Some(cur_builder) =>
@@ -487,7 +498,7 @@ impl Derive
 		}
 	}
 
-	fn add_type(&self, ns: Ns, filename: &Arc<String>, n_line: usize, name: String, if_not_exists: bool) -> Result<(), String>
+	fn add_type(&self, ns: &Ns, filename: &Arc<String>, n_line: usize, name: String, if_not_exists: bool) -> Result<(), String>
 	{	self.with_builder
 		(	ns, filename, n_line, move |builder, grammar|
 			{	let rust_type = format!("super::super::{}", name);
@@ -504,7 +515,7 @@ impl Derive
 		)
 	}
 
-	fn add_rule(&self, ns: Ns, filename: &Arc<String>, n_line: usize, lhs_name: String, rhs: String, code: String) -> Result<(), String>
+	fn add_rule(&self, ns: &Ns, filename: &Arc<String>, n_line: usize, lhs_name: String, rhs: String, code: String) -> Result<(), String>
 	{	self.with_builder
 		(	ns, filename, n_line, move |builder, grammar|
 			{	if cfg!(feature = "dump-grammar")
@@ -518,15 +529,15 @@ impl Derive
 		)
 	}
 
-	fn get_lemon_result(&self, ns: Ns, filename: &Arc<String>, n_line: usize, start_symbol_name: String) -> Result<String, String>
+	fn get_lemon_result(&self, ns: &Ns, filename: &Arc<String>, n_line: usize, start_symbol_name: String) -> Result<String, String>
 	{	let mut map = self.builders.lock().unwrap();
-		match map.remove(&ns)
+		match map.remove(ns)
 		{	None =>
 			{	Err("No parser rules".to_string())
 			}
 			Some(CurBuilder::Active(mut builder, grammar)) =>
 			{	if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
-				{	eprintln!("/* Parser lem_{} from {} */", ns.hash, filename);
+				{	eprintln!("/* Parser {} from {} */", ns.name, filename);
 				}
 				if cfg!(feature = "dump-grammar") || cfg!(feature = "dump-lemon-grammar")
 				{	eprintln!("%start_symbol {{{}}}", if cfg!(feature = "dump-lemon-grammar") {Self::lc_first(&start_symbol_name).into()} else {Cow::from(&start_symbol_name)});
@@ -539,7 +550,7 @@ impl Derive
 				let lemon = builder.try_into_lemon().map_err(|e| e.to_string())?;
 				lemon.gen_rust(&mut rust).map_err(|e| e.to_string())?;
 				map.insert
-				(	ns,
+				(	ns.clone(),
 					if ns.is_real_file
 					{	CurBuilder::Complete(n_line)
 					}
@@ -557,7 +568,7 @@ impl Derive
 
 	fn lem_fn_attr(&self, args: TokenStream, item: TokenStream) -> Result<TokenStream, String>
 	{	let (ns, filename, n_line) = self.get_location(item.clone())?;
-		self.reinit_if_needed(ns, n_line);
+		self.reinit_if_needed(&ns, n_line);
 		let values = Self::lem_fn_attr_parse(args)?;
 		let (fn_name, mut fn_args, fn_return) = Self::lem_fn_attr_parse_fn(item.clone())?;
 		let mut has_extra = false;
@@ -572,7 +583,7 @@ impl Derive
 		if has_extra
 		{	fn_args.pop();
 		}
-		self.add_type(ns, &filename, n_line, fn_return.clone(), true)?;
+		self.add_type(&ns, &filename, n_line, fn_return.clone(), true)?;
 		for value in values
 		{	if !value.trim().is_empty()
 			{	let (value, aliases) = Self::parse_rhs(&value, fn_args.len(), Some(&fn_args), true)?;
@@ -595,10 +606,10 @@ impl Derive
 					}
 					action = quote!(#action extra);
 				}
-				self.add_rule(ns, &filename, n_line, fn_return.clone(), value, quote!(super::super::#fn_name(#action)).to_string())?;
+				self.add_rule(&ns, &filename, n_line, fn_return.clone(), value, quote!(super::super::#fn_name(#action)).to_string())?;
 			}
 		}
-		self.log_last_use(ns, n_line);
+		self.log_last_use(&ns, n_line);
 		Ok(item)
 	}
 
