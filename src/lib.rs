@@ -1,11 +1,6 @@
 //! Helper crate for [lemon-tree](https://crates.io/crates/lemon-tree). Rust-way parser builder.
 
-#![feature(proc_macro_span)]
-
-extern crate lemon_mint;
 extern crate proc_macro;
-extern crate proc_macro2;
-extern crate once_cell;
 
 use std::mem;
 use std::collections::{HashSet, HashMap};
@@ -14,7 +9,7 @@ use std::sync::{Mutex, Arc};
 use std::time::SystemTime;
 use syn::{self, DeriveInput, Data, Attribute, Meta, NestedMeta, Lit, Ident, ItemFn, ReturnType, Type, TypePath, Path, PathSegment, PathArguments, FnArg, PatType, Pat};
 use crate::proc_macro::TokenStream;
-use crate::proc_macro2::Span;
+use proc_macro2::Span;
 use quote::quote;
 use once_cell::sync::OnceCell;
 use lemon_mint::LemonMintBuilder;
@@ -28,7 +23,7 @@ static DERIVE: OnceCell<Derive> = OnceCell::new();
 pub fn derive_lemon_tree(input: TokenStream) -> TokenStream
 {	match DERIVE.get_or_init(|| Default::default()).derive(input, true)
 	{	Ok(ts) => ts,
-		Err(error) => panic!(error),
+		Err(error) => panic!("{}", error),
 	}
 }
 
@@ -37,7 +32,7 @@ pub fn derive_lemon_tree(input: TokenStream) -> TokenStream
 pub fn derive_lemon_tree_node(input: TokenStream) -> TokenStream
 {	match DERIVE.get_or_init(|| Default::default()).derive(input, false)
 	{	Ok(ts) => ts,
-		Err(error) => panic!(error),
+		Err(error) => panic!("{}", error),
 	}
 }
 
@@ -46,7 +41,7 @@ pub fn derive_lemon_tree_node(input: TokenStream) -> TokenStream
 pub fn lem_fn(attr: TokenStream, item: TokenStream) -> TokenStream
 {	match DERIVE.get_or_init(|| Default::default()).lem_fn_attr(attr, item)
 	{	Ok(item) => item,
-		Err(error) => panic!(error),
+		Err(error) => panic!("{}", error),
 	}
 }
 
@@ -461,13 +456,14 @@ impl Derive
 
 	fn get_location(&self, input: TokenStream) -> Result<(Ns, Arc<String>, usize), String>
 	{	let span = input.into_iter().next().unwrap().span();
-		let filename = span.source_file();
-		let n_line = span.start();
-		let is_real_file = filename.is_real();
+		let filename_str = span.file();
+		let n_line = span.line();
+		let path = std::path::Path::new(&filename_str);
+		let is_real_file = path.exists();
 		let mut strings_pool = self.strings_pool.lock().unwrap();
-		let ns_name = strings_pool.get(filename.path().file_stem().unwrap().to_string_lossy().into_owned());
-		let filename = strings_pool.get(filename.path().to_string_lossy().into_owned());
-		let n_line = n_line.line;
+		let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| filename_str.clone());
+		let ns_name = strings_pool.get(stem);
+		let filename = strings_pool.get(filename_str);
 		Ok((Ns{name: ns_name, is_real_file}, filename, n_line))
 	}
 
@@ -486,11 +482,11 @@ impl Derive
 				match my_cur_builder
 				{	CurBuilder::Active(mut builder, mut grammar) =>
 					{	builder = cb(builder, &mut grammar)?;
-						mem::replace(cur_builder, CurBuilder::Active(builder, grammar));
+						*cur_builder = CurBuilder::Active(builder, grammar);
 						Ok(())
 					}
 					CurBuilder::Complete(complete_n_line) =>
-					{	mem::replace(cur_builder, CurBuilder::Complete(complete_n_line));
+					{	*cur_builder = CurBuilder::Complete(complete_n_line);
 						Err(format!("#[derive(LemonTree)] must be the last in file. Found at line {}, but additional directive at line {} in file {}", complete_n_line, n_line, filename))
 					}
 				}
